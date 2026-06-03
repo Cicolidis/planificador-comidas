@@ -588,8 +588,16 @@ async function loadAll(background=false) {
     ]);
     state.comidas = comidas || [];
     state.plan = {};
-    (plan||[]).forEach(e => { state.plan[`${e.dia}__${e.turno}`] = e.comida_id; });
-    (despensa||[]).forEach(e => { state.despensa[e.key] = e.status; });
+    (plan||[]).forEach(e => {
+      const key = `${e.dia}__${e.turno}`;
+      state.plan[key] = String(e.comida_id);
+    });
+    const serverDespensa = {};
+    (despensa||[]).forEach(e => { serverDespensa[e.key] = e.status; });
+    Object.keys(state.despensa).forEach(k => {
+      if (!(k in serverDespensa)) serverDespensa[k] = state.despensa[k];
+    });
+    state.despensa = serverDespensa;
     saveCache();
     setSyncStatus("Sincronizado · " + new Date().toLocaleTimeString('es-AR',{hour:'2-digit',minute:'2-digit'}));
     renderAll();
@@ -602,8 +610,10 @@ async function loadAll(background=false) {
 async function savePlanToSheets() {
   setSyncStatus("Guardando...");
   const entradas = Object.entries(state.plan).map(([key,comida_id])=>{
-    const [dia,turno] = key.split("__");
-    return {dia,turno,comida_id};
+    const idx = key.indexOf("__");
+    const dia = key.substring(0, idx);
+    const turno = key.substring(idx+2);
+    return {dia, turno, comida_id};
   });
   try {
     await sheetsCall("savePlan", {semana: weekKey(), entradas});
@@ -769,19 +779,52 @@ function despensaBgStyle(status) {
   return "";
 }
 
+function getFutureSlots() {
+  // Returns [{dia, turno, slotKey, comidaId, date}] for today and future, sorted chronologically
+  const now = new Date(); now.setHours(0,0,0,0);
+  const dates = getWeekDates(state.currentWeek, state.currentYear);
+  const slots = [];
+  DIAS.forEach((dia, di) => {
+    const date = dates[di];
+    if (date < now) return; // skip past days
+    TURNOS.forEach((turno, ti) => {
+      // principal
+      const mainKey = `${dia}__${turno}`;
+      if (state.plan[mainKey]) slots.push({dia, turno, slotKey: mainKey, comidaId: state.plan[mainKey], date, turnIdx: ti});
+      // guarniciones
+      for (let i=0; i<5; i++) {
+        const gKey = `${dia}__${turno}__g${i}`;
+        if (state.plan[gKey]) slots.push({dia, turno, slotKey: gKey, comidaId: state.plan[gKey], date, turnIdx: ti});
+      }
+    });
+  });
+  // Sort: earlier date first, almuerzo before cena
+  slots.sort((a,b) => a.date - b.date || a.turnIdx - b.turnIdx);
+  return slots;
+}
+
 function renderDespensa() {
   const list = document.getElementById("despensa-list");
   if (!list) return;
-  const planComidaIds = [...new Set(Object.values(state.plan))];
-  if (!planComidaIds.length) { list.innerHTML=`<div class="empty">No hay comidas planificadas esta semana</div>`; return; }
+  const futureSlots = getFutureSlots();
+  if (!futureSlots.length) { list.innerHTML=`<div class="empty">No hay comidas planificadas a partir de hoy</div>`; return; }
   list.innerHTML="";
-  planComidaIds.forEach(cid=>{
-    const comida = state.comidas.find(c=>String(c.id)===String(cid));
+  // Deduplicate by comidaId but keep order (first occurrence wins)
+  const seen = new Set();
+  const orderedComidas = [];
+  futureSlots.forEach(slot => {
+    const cid = String(slot.comidaId);
+    if (!seen.has(cid)) { seen.add(cid); orderedComidas.push({cid, slot}); }
+  });
+  orderedComidas.forEach(({cid, slot}) => {
+    const comida = state.comidas.find(c=>String(c.id)===cid);
     if (!comida) return;
     const ings = Array.isArray(comida.ingredientes)?comida.ingredientes:[];
     if (!ings.length) return;
     const status = getComidaStatus(cid);
     const {bg,border,color} = chipBg(status);
+    // Date label
+    const dateLabel = slot.date.toLocaleDateString('es-AR',{weekday:'short',day:'numeric',month:'short'});
     const block = document.createElement("div");
     block.className = "despensa-comida";
     block.style.cssText = `border-color:${border}`;
@@ -798,7 +841,10 @@ function renderDespensa() {
         <input type="checkbox" id="all-${cid}" ${allChecked?"checked":""} 
           style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer"
           onchange="toggleAllDespensaIng('${cid}',this.checked)">
-        <span style="font-weight:500;font-size:12px">${comida.nombre}</span>
+        <div>
+          <div style="font-weight:500;font-size:12px">${comida.nombre}</div>
+          <div style="font-size:10px;opacity:.65">${dateLabel} · ${slot.turno.split("__")[0]}</div>
+        </div>
       </label>
       <span style="font-size:10px;opacity:.7">${ings.length} ing.</span>`;
 
@@ -881,6 +927,8 @@ function handleDrop(dia, turno) {
   state.draggingComida = null;
   state.draggingFrom = null;
   renderGrid();
+  renderDespensa();
+  updateDespensaBadge();
   savePlanToSheets();
 }
 
@@ -888,6 +936,8 @@ function removeMeal(slotKey, e) {
   e.stopPropagation();
   delete state.plan[slotKey];
   renderGrid();
+  renderDespensa();
+  updateDespensaBadge();
   savePlanToSheets();
 }
 
@@ -1042,8 +1092,17 @@ function showPreview(comida) {
   document.getElementById("preview-receta").textContent=comida.receta||"(sin receta)";
   document.getElementById("preview-translating").style.display="none";
   openModal("modal-preview");
-  // Auto-translate if from Spoonacular
-  if (comida.fuente==="spoonacular" && state.claudeKey) translatePreview(comida);
+  // Auto-translate if from Spoonacular — wait briefly for config if needed
+  if (comida.fuente==="spoonacular") {
+    const attemptTranslate = (retries=0) => {
+      if (state.claudeKey) {
+        translatePreview(comida);
+      } else if (retries < 10) {
+        setTimeout(()=>attemptTranslate(retries+1), 300);
+      }
+    };
+    attemptTranslate();
+  }
 }
 
 async function translatePreview(comida) {
@@ -1513,12 +1572,13 @@ async function executeDuplicate() {
 // ── INIT ───────────────────────────────────────────────────────────────────
 
 async function init() {
-  const hasCached=loadCache();
+  // Load config first so claudeKey/spoonacularKey are available before any user action
+  await loadConfigFromSheets();
+  const hasCached = loadCache();
   if (hasCached) {
     renderAll();
     setSyncStatus("Cargando datos actualizados...");
   }
-  await loadConfigFromSheets();
   await loadAll(hasCached);
 }
 
