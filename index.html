@@ -504,14 +504,16 @@ function setIngStatus(comidaId, ingNombre, status) {
 
 function getComidaStatus(comidaId) {
   const comida = state.comidas.find(c=>String(c.id)===String(comidaId));
-  if (!comida) return "none";
+  if (!comida) return "unknown";
   const ings = Array.isArray(comida.ingredientes) ? comida.ingredientes : [];
-  if (!ings.length) return "none";
-  const statuses = ings.map(i=>getIngStatus(comidaId, i.nombre));
-  const known = statuses.filter(s=>s!=="unknown");
-  if (!known.length) return "unknown";
-  if (known.every(s=>s==="si")) return "all";
-  if (known.some(s=>s==="si")) return "some";
+  if (!ings.length) return "unknown";
+  const statuses = ings.map(i => getIngStatus(comidaId, i.nombre));
+  const siCount = statuses.filter(s=>s==="si").length;
+  const noCount = statuses.filter(s=>s==="no").length;
+  const markedCount = siCount + noCount;
+  if (markedCount === 0) return "unknown";
+  if (siCount === ings.length) return "all";
+  if (siCount > 0) return "some";
   return "missing";
 }
 
@@ -684,20 +686,28 @@ function getSlotComidas(dia, turno) {
   return results;
 }
 
+function chipBg(status) {
+  if (status==="all") return {bg:"#D1F5E0",border:"#6FCF97",color:"#1a4731"};
+  if (status==="some") return {bg:"#FEF3CD",border:"#F5C842",color:"#6B4A00"};
+  if (status==="missing") return {bg:"#FDDEDE",border:"#F08080",color:"#7A1A1A"};
+  return {bg:"#F1EFE8",border:"#D3D1C7",color:"#2C2C2A"};
+}
+
 function createMealChip(comida, dia, turno, slotKey) {
-  const ci = colorIdx(comida.id);
   const status = getComidaStatus(comida.id);
-  const statusClass = status==="all"?"status-all":status==="some"?"status-some":"status-none";
+  const {bg,border,color} = chipBg(status);
   const isGuarn = comida.tipo==="guarnicion";
   const chip = document.createElement("div");
-  chip.className = `meal-chip cc${ci}${isGuarn?" type-guarnicion":""}`;
+  chip.className = `meal-chip${isGuarn?" type-guarnicion":""}`;
+  chip.style.cssText = `background:${bg};border-color:${border};color:${color}`;
   chip.draggable = true;
+  const tooltip = status==="all"?"Todo en casa":status==="some"?"Algunos faltan":status==="missing"?"Faltan ingredientes":"Sin marcar";
   chip.innerHTML = `
     <div class="chip-text">
       ${isGuarn?'<span class="chip-type-label">+ </span>':''}${comida.nombre}
     </div>
-    <div class="chip-status ${statusClass}" title="${status==='all'?'Todo en casa':status==='some'?'Faltan algunos':'Sin marcar'}"></div>
     <button class="chip-remove" title="Quitar" onclick="removeMeal('${slotKey}',event)">×</button>`;
+  chip.title = tooltip;
   chip.addEventListener("dragstart", ()=>{ chip.classList.add("dragging"); state.draggingComida=String(comida.id); state.draggingFrom={slotKey}; });
   chip.addEventListener("dragend", ()=>chip.classList.remove("dragging"));
   return chip;
@@ -752,10 +762,16 @@ function createComidaCard(comida, freq) {
   return card;
 }
 
+function despensaBgStyle(status) {
+  if (status==="all") return "background:#D1F5E0;border-color:#6FCF97";
+  if (status==="some") return "background:#FEF3CD;border-color:#F5C842";
+  if (status==="missing") return "background:#FDDEDE;border-color:#F08080";
+  return "";
+}
+
 function renderDespensa() {
   const list = document.getElementById("despensa-list");
   if (!list) return;
-  // Get all comidas in current week's plan
   const planComidaIds = [...new Set(Object.values(state.plan))];
   if (!planComidaIds.length) { list.innerHTML=`<div class="empty">No hay comidas planificadas esta semana</div>`; return; }
   list.innerHTML="";
@@ -764,27 +780,67 @@ function renderDespensa() {
     if (!comida) return;
     const ings = Array.isArray(comida.ingredientes)?comida.ingredientes:[];
     if (!ings.length) return;
+    const status = getComidaStatus(cid);
+    const {bg,border,color} = chipBg(status);
     const block = document.createElement("div");
     block.className = "despensa-comida";
+    block.style.cssText = `border-color:${border}`;
+
+    // Header with select-all checkbox
     const header = document.createElement("div");
     header.className = "despensa-comida-header";
-    const status = getComidaStatus(cid);
-    const dot = status==="all"?'🟢':status==="some"?'🟡':status==="missing"?'🔴':'⚪';
-    header.innerHTML = `<span>${dot} ${comida.nombre}</span><span style="font-size:10px;color:var(--text3)">${ings.length} ing.</span>`;
+    header.style.cssText = `background:${bg};color:${color}`;
+    const allChecked = ings.every(i=>getIngStatus(cid,i.nombre)==="si");
+    const noneChecked = ings.every(i=>getIngStatus(cid,i.nombre)!=="si");
+    const indeterminate = !allChecked && !noneChecked;
+    header.innerHTML = `
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;flex:1">
+        <input type="checkbox" id="all-${cid}" ${allChecked?"checked":""} 
+          style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer"
+          onchange="toggleAllDespensaIng('${cid}',this.checked)">
+        <span style="font-weight:500;font-size:12px">${comida.nombre}</span>
+      </label>
+      <span style="font-size:10px;opacity:.7">${ings.length} ing.</span>`;
+
+    // Mark indeterminate after render
+    setTimeout(()=>{
+      const cb = document.getElementById(`all-${cid}`);
+      if (cb) cb.indeterminate = indeterminate;
+    }, 0);
+
     const ingsDiv = document.createElement("div");
     ingsDiv.className = "despensa-ings";
+    ingsDiv.id = `ings-block-${cid}`;
+    ingsDiv.style.cssText = `background:${bg}22`;
     ings.forEach(ing=>{
       const row = document.createElement("div");
       row.className = "despensa-ing-row";
-      const status = getIngStatus(cid, ing.nombre);
-      const checked = status==="si";
-      row.innerHTML = `<label><input type="checkbox" ${checked?"checked":""} onchange="toggleDespensaIng('${cid}','${ing.nombre.replace(/'/g,"\\'")}',this.checked)"> ${ing.nombre}${ing.cantidad?` <span style="color:var(--text3)">(${ing.cantidad})</span>`:''}</label>`;
+      const ingStatus = getIngStatus(cid, ing.nombre);
+      const checked = ingStatus==="si";
+      const safeName = ing.nombre.replace(/\\/g,"\\\\").replace(/'/g,"\\'");
+      row.innerHTML = `<label><input type="checkbox" ${checked?"checked":""} 
+        style="accent-color:var(--accent)"
+        onchange="toggleDespensaIng('${cid}','${safeName}',this.checked)"> 
+        ${ing.nombre}${ing.cantidad?` <span style="color:var(--text3)">(${ing.cantidad})</span>`:''}</label>`;
       ingsDiv.appendChild(row);
     });
     block.appendChild(header);
     block.appendChild(ingsDiv);
     list.appendChild(block);
   });
+}
+
+function toggleAllDespensaIng(comidaId, checked) {
+  const comida = state.comidas.find(c=>String(c.id)===String(comidaId));
+  if (!comida) return;
+  const ings = Array.isArray(comida.ingredientes)?comida.ingredientes:[];
+  ings.forEach(ing=>{ setIngStatus(comidaId, ing.nombre, checked?"si":"no"); });
+  saveDespensaToSheets();
+  renderGrid();
+  renderDespensa();
+  renderSidebarComidas("principal");
+  renderSidebarComidas("guarnicion");
+  updateDespensaBadge();
 }
 
 function updateDespensaBadge() {
@@ -994,22 +1050,37 @@ async function translatePreview(comida) {
   const transDiv = document.getElementById("preview-translating");
   transDiv.style.display="block";
   try {
-    const prompt=`Traducí al español rioplatense los siguientes datos de una receta. Respondé SOLO con JSON válido:
-{"nombre":"...","ingredientes":[{"nombre":"...","cantidad":"..."}],"receta":"..."}
-Datos originales: ${JSON.stringify({nombre:comida.nombre,ingredientes:comida.ingredientes,receta:comida.receta})}`;
-    const res=await fetch("https://api.anthropic.com/v1/messages",{
+    const dataToTranslate = {
+      nombre: comida.nombre,
+      ingredientes: comida.ingredientes||[],
+      receta: comida.receta||""
+    };
+    const prompt = `Traducí al español rioplatense estos datos de una receta. Respondé SOLO con JSON válido, sin texto adicional ni markdown:\n{"nombre":"...","ingredientes":[{"nombre":"...","cantidad":"..."}],"receta":"..."}\nDatos: ${JSON.stringify(dataToTranslate)}`;
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
       method:"POST",
-      headers:{"Content-Type":"application/json","x-api-key":state.claudeKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-      body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1200,messages:[{role:"user",content:prompt}]})
+      headers:{
+        "Content-Type":"application/json",
+        "x-api-key":state.claudeKey,
+        "anthropic-version":"2023-06-01",
+        "anthropic-dangerous-direct-browser-access":"true"
+      },
+      body: JSON.stringify({
+        model:"claude-sonnet-4-6",
+        max_tokens:1500,
+        messages:[{role:"user", content:prompt}]
+      })
     });
-    const data=await res.json();
+    const data = await res.json();
     if (data.error) throw new Error(data.error.message);
-    const translated=JSON.parse(data.content[0].text.replace(/```json|```/g,"").trim());
-    state.previewComida={...comida,...translated,fuente:"spoonacular"};
-    document.getElementById("preview-nombre").textContent=translated.nombre;
-    document.getElementById("preview-ings").innerHTML=(translated.ingredientes||[]).map(i=>`• <strong>${i.nombre}</strong> ${i.cantidad||''}`).join("<br>");
-    document.getElementById("preview-receta").textContent=translated.receta||"";
-  } catch(e) {}
+    const rawText = data.content[0].text.replace(/```json|```/g,"").trim();
+    const translated = JSON.parse(rawText);
+    state.previewComida = {...comida, ...translated, fuente:"spoonacular"};
+    document.getElementById("preview-nombre").textContent = translated.nombre||comida.nombre;
+    document.getElementById("preview-ings").innerHTML = (translated.ingredientes||[]).map(i=>`• <strong>${i.nombre}</strong> ${i.cantidad||''}`).join("<br>");
+    document.getElementById("preview-receta").textContent = translated.receta||"";
+  } catch(e) {
+    console.error("Error al traducir:", e);
+  }
   transDiv.style.display="none";
 }
 
